@@ -10,6 +10,7 @@ import {
   buildSafeTransaction,
   buildContractCall,
   calculateRelayMessageHash,
+  executeTx,
 } from '../../src/utils/execution'
 import { parseEther } from '@ethersproject/units'
 import { chainId } from '../utils/encoding'
@@ -76,7 +77,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
   describe('getRelayMessageHash', () => {
     it('should correctly calculate EIP-712 hash of the relay message', async () => {
-      const { safe, transactionQueueInstance, storageSetter } = await setupTests()
+      const { safe, transactionQueueInstance } = await setupTests()
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
       const transactionHash = await transactionQueueInstance.getTransactionHash(
@@ -106,13 +107,32 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
   })
 
   describe('execTransaction', () => {
-    it('should revert if signature data is not present', async () => {})
+    it('should revert if signature data is not present', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
 
-    it('should revert if signatures are invalid', async () => {})
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
 
-    it("should revert if the transaction nonce doesn't match current safe nonce", async () => {})
+      const signatures =
+        '0x' +
+        '000000000000000000000000' +
+        user1.address.slice(2) +
+        '0000000000000000000000000000000000000000000000000000000000000041' +
+        '00' // r, s, v
 
-    it('should increase the nonce', async () => {})
+      executeTx(transactionQueueInstance, safeTransaction, [{ signer: user1.address, data: signatures }])
+    })
+
+    it('should revert if signatures are invalid', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+    })
+
+    it("should revert if the signed nonce doesn't match current safe nonce", async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+    })
+
+    it('should increase the nonce', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+    })
   })
 
   describe('execTransactionWithRefund', () => {
