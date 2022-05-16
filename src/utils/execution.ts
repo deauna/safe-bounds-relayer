@@ -1,4 +1,4 @@
-import { Contract, Wallet, utils, BigNumber, BigNumberish, Signer, PopulatedTransaction } from 'ethers'
+import { Contract, Wallet, utils, BigNumber, BigNumberish, Signer } from 'ethers'
 import { TypedDataSigner } from '@ethersproject/abstract-signer'
 import { AddressZero } from '@ethersproject/constants'
 
@@ -23,7 +23,7 @@ const EIP712_SAFE_TX_TYPE = {
 
 const EIP712_RELAY_MESSAGE_TYPE = {
   // "RelayMsg(bytes32 safeTxHash,address gasToken,uint120 gasLimit,uint120 maxFeePerGas,address refundReceiver)"
-  SafeMessage: [
+  RelayMsg: [
     { type: 'bytes32', name: 'safeTxHash' },
     { type: 'address', name: 'gasToken' },
     { type: 'uint120', name: 'gasLimit' },
@@ -66,6 +66,10 @@ const calculateSafeTransactionHash = (transactionQueue: Contract, safeTx: SafeTr
   return utils._TypedDataEncoder.hash({ verifyingContract: transactionQueue.address, chainId }, EIP712_SAFE_TX_TYPE, safeTx)
 }
 
+const preimageRelayMessageHash = (transactionQueue: Contract, relayMessage: RelayMessage, chainId: BigNumberish): string => {
+  return utils._TypedDataEncoder.encode({ verifyingContract: transactionQueue.address, chainId }, EIP712_RELAY_MESSAGE_TYPE, relayMessage)
+}
+
 const calculateRelayMessageHash = (transactionQueue: Contract, relayMessage: RelayMessage, chainId: BigNumberish): string => {
   return utils._TypedDataEncoder.hash({ verifyingContract: transactionQueue.address, chainId }, EIP712_RELAY_MESSAGE_TYPE, relayMessage)
 }
@@ -90,9 +94,9 @@ const safeApproveHash = async (
   }
 }
 
-const safeSignTypedData = async (
-  signer: Signer & TypedDataSigner,
-  safe: Contract,
+const queueSignTypedData = async (
+  signer: Wallet,
+  transactionQueue: Contract,
   safeTx: SafeTransaction,
   chainId?: BigNumberish,
 ): Promise<SafeSignature> => {
@@ -101,20 +105,25 @@ const safeSignTypedData = async (
   const signerAddress = await signer.getAddress()
   return {
     signer: signerAddress,
-    data: await signer._signTypedData({ verifyingContract: safe.address, chainId: cid }, EIP712_SAFE_TX_TYPE, safeTx),
+    data: await signer._signTypedData({ verifyingContract: transactionQueue.address, chainId: cid }, EIP712_SAFE_TX_TYPE, safeTx),
   }
 }
 
 const signHash = async (signer: Signer, hash: string): Promise<SafeSignature> => {
-  const typedDataHash = utils.arrayify(hash)
+  const uint8hash = utils.arrayify(hash)
   const signerAddress = await signer.getAddress()
   return {
     signer: signerAddress,
-    data: await signer.signMessage(typedDataHash),
+    data: await signer.signMessage(uint8hash),
   }
 }
 
-const safeSignMessage = async (signer: Signer, safe: Contract, safeTx: SafeTransaction, chainId?: BigNumberish): Promise<SafeSignature> => {
+const queueSignMessage = async (
+  signer: Signer,
+  safe: Contract,
+  safeTx: SafeTransaction,
+  chainId?: BigNumberish,
+): Promise<SafeSignature> => {
   const cid = chainId || (await signer.provider!!.getNetwork()).chainId
   return signHash(signer, calculateSafeTransactionHash(safe, safeTx, cid))
 }
@@ -126,6 +135,34 @@ const buildSignatureBytes = (signatures: SafeSignature[]): string => {
     signatureBytes += sig.data.slice(2)
   }
   return signatureBytes
+}
+
+const signRelayMessageHash = async (
+  signer: Wallet,
+  transactionQueue: Contract,
+  relayMessage: RelayMessage,
+  chainId?: BigNumberish,
+): Promise<SafeSignature> => {
+  const cid = chainId || (await signer.provider!!.getNetwork()).chainId
+  return signHash(signer, calculateRelayMessageHash(transactionQueue, relayMessage, cid))
+}
+
+const signRelayMessageTypedData = async (
+  signer: Wallet,
+  transactionQueue: Contract,
+  relayMessage: RelayMessage,
+  chainId?: BigNumberish,
+): Promise<SafeSignature> => {
+  const cid = chainId || (await signer.provider!!.getNetwork()).chainId
+  const signerAddress = await signer.getAddress()
+  return {
+    signer: signerAddress,
+    data: await signer._signTypedData(
+      { verifyingContract: transactionQueue.address, chainId: cid },
+      EIP712_RELAY_MESSAGE_TYPE,
+      relayMessage,
+    ),
+  }
 }
 
 const logGas = async (message: string, tx: Promise<any>, skip?: boolean): Promise<any> => {
@@ -172,26 +209,65 @@ const executeTx = async (
   )
 }
 
-const buildContractCall = (
-  contract: Contract,
-  method: string,
-  params: any[],
-  transactionParams: Omit<SafeTransaction, 'data'>,
-): SafeTransaction => {
-  const data = contract.interface.encodeFunctionData(method, params)
-  return buildSafeTransaction(
-    transactionParams.safe,
-    contract.address,
-    transactionParams.value,
-    data,
-    transactionParams.operation,
-    transactionParams.nonce,
+const executeTxWithRefund = async (
+  transactionQueue: Contract,
+  safeTx: SafeTransaction,
+  txSignatures: SafeSignature[],
+  relayParams: RelayMessage,
+  refundSignature: SafeSignature,
+  overrides?: any,
+): Promise<any> => {
+  const signatureBytes = buildSignatureBytes(txSignatures)
+  const refundSignatureBytes = buildSignatureBytes([refundSignature])
+  return transactionQueue.execTransactionWithRefund(
+    {
+      safe: safeTx.safe,
+      to: safeTx.to,
+      value: safeTx.value,
+      data: safeTx.data,
+      operation: safeTx.operation,
+    },
+    signatureBytes,
+    relayParams,
+    refundSignatureBytes,
+    overrides || {},
   )
 }
 
-const executeTxWithSigners = async (safe: Contract, tx: SafeTransaction, signers: Wallet[], overrides?: any) => {
-  const sigs = await Promise.all(signers.map((signer) => safeSignTypedData(signer, safe, tx)))
-  return executeTx(safe, tx, sigs, overrides)
+const buildContractCall = (
+  safeAddress: string,
+  contract: Contract,
+  method: string,
+  params: any[],
+  transactionParams: Partial<Omit<SafeTransaction, 'data' | 'to'>>,
+): SafeTransaction => {
+  const data = contract.interface.encodeFunctionData(method, params)
+  return buildSafeTransaction(
+    safeAddress,
+    contract.address,
+    transactionParams.value || 0,
+    data,
+    transactionParams.operation || 0,
+    transactionParams.nonce || '0',
+  )
+}
+
+const executeTxWithSigners = async (transactionQueue: Contract, tx: SafeTransaction, signers: Wallet[], overrides?: any) => {
+  const sigs = await Promise.all(signers.map((signer) => queueSignTypedData(signer, transactionQueue, tx)))
+  return executeTx(transactionQueue, tx, sigs, overrides)
+}
+
+const executeTxWithSignersAndRefund = async (
+  transactionQueue: Contract,
+  tx: SafeTransaction,
+  signers: Wallet[],
+  relayParams: RelayMessage,
+  relaySigner: Wallet,
+  overrides?: any,
+) => {
+  const txSigs = await Promise.all(signers.map((signer) => queueSignTypedData(signer, transactionQueue, tx)))
+  const relaySignature = await signRelayMessageTypedData(relaySigner, transactionQueue, relayParams)
+  return executeTxWithRefund(transactionQueue, tx, txSigs, relayParams, relaySignature, overrides)
 }
 
 const executeContractCallWithSigners = async (
@@ -200,10 +276,16 @@ const executeContractCallWithSigners = async (
   method: string,
   params: any[],
   signers: Wallet[],
-  delegateCall?: boolean,
-  overrides?: Partial<SafeTransaction>,
+  transactionParams: Omit<SafeTransaction, 'data'>,
+  relayParams?: RelayMessage,
+  relaySigner?: Wallet,
 ) => {
-  const tx = buildContractCall(contract, method, params, await safe.nonce(), delegateCall, overrides)
+  const tx = buildContractCall(safe.address, contract, method, params, transactionParams)
+
+  if (!relayParams && !relaySigner) {
+    executeTxWithSigners(safe, tx, signers)
+  }
+
   return executeTxWithSigners(safe, tx, signers)
 }
 
@@ -217,16 +299,20 @@ export {
   calculateSafeDomainSeparator,
   preimageSafeTransactionHash,
   calculateSafeTransactionHash,
+  preimageRelayMessageHash,
   calculateRelayMessageHash,
   buildSafeTransaction,
   safeApproveHash,
-  safeSignTypedData,
+  queueSignTypedData,
   signHash,
-  safeSignMessage,
+  queueSignMessage,
   buildSignatureBytes,
+  signRelayMessageHash,
+  signRelayMessageTypedData,
   logGas,
   executeTx,
   buildContractCall,
+  executeTxWithSignersAndRefund,
   executeTxWithSigners,
   executeContractCallWithSigners,
 }

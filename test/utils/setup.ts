@@ -1,3 +1,4 @@
+import { AddressZero } from '@ethersproject/constants'
 import hre, { deployments } from 'hardhat'
 import { Signer, Contract } from 'ethers'
 import solc from 'solc'
@@ -7,7 +8,7 @@ export const transactionQueueDeployment = async () => {
 }
 
 export const transactionQueueContract = async () => {
-  return await hre.ethers.getContractFactory('SafeEIP4337Diatomic')
+  return await hre.ethers.getContractFactory('SafeTransactionQueueConditionalRefund')
 }
 
 export const getSafeAtAddress = async (address: string) => {
@@ -16,10 +17,10 @@ export const getSafeAtAddress = async (address: string) => {
   return safeMock.attach(address)
 }
 
-export const getTestSafe = async (deployer: Signer, fallbackHandler?: string, moduleAddr?: string) => {
+export const getTestSafe = async (deployer: Signer, moduleAddr?: string) => {
   const safeFactory = await hre.ethers.getContractFactory('GnosisSafeMock')
   const factoryWithDeployer = safeFactory.connect(deployer)
-  const safe = factoryWithDeployer.deploy(fallbackHandler, moduleAddr)
+  const safe = factoryWithDeployer.deploy(moduleAddr || AddressZero)
 
   return safe
 }

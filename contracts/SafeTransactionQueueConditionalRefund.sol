@@ -52,8 +52,8 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
     struct SafeTx {
         address payable safe;
         address to;
-        bytes data;
         uint256 value;
+        bytes data;
         Enum.Operation operation;
     }
 
@@ -227,7 +227,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         uint256 nonce,
         Enum.Operation operation
     ) public view returns (bytes memory) {
-        bytes32 safeTransactionHash = keccak256(abi.encode(SAFE_TX_TYPEHASH, safe, to, keccak256(data), value, nonce, operation));
+        bytes32 safeTransactionHash = keccak256(abi.encode(SAFE_TX_TYPEHASH, safe, to, value, keccak256(data), operation, nonce));
 
         return abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), safeTransactionHash);
     }
@@ -259,11 +259,11 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
     function encodeRelayMessageData(
         bytes32 safeTxHash,
         address gasToken,
-        uint120 baseGas,
+        uint120 gasLimit,
         uint120 maxFeePerGas,
         address refundReceiver
     ) public view returns (bytes memory) {
-        bytes32 safeOperationHash = keccak256(abi.encode(SAFE_TX_TYPEHASH, safeTxHash, gasToken, baseGas, maxFeePerGas, refundReceiver));
+        bytes32 safeOperationHash = keccak256(abi.encode(RELAY_MSG_TYPEHASH, safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver));
 
         return abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), safeOperationHash);
     }
@@ -277,11 +277,11 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
     function getRelayMessageHash(
         bytes32 safeTxHash,
         address gasToken,
-        uint120 baseGas,
+        uint120 gasLimit,
         uint120 maxFeePerGas,
         address refundReceiver
     ) public view returns (bytes32) {
-        return keccak256(encodeRelayMessageData(safeTxHash, gasToken, baseGas, maxFeePerGas, refundReceiver));
+        return keccak256(encodeRelayMessageData(safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver));
     }
 
     /// @dev Internal function to execute a transaction from the Safe

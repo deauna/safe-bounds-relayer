@@ -4,7 +4,13 @@ import { expect } from 'chai'
 import hre, { deployments, waffle } from 'hardhat'
 import '@nomiclabs/hardhat-ethers'
 import { deployContract, getTestSafe, getTransactionQueueInstance } from '../utils/setup'
-import { buildSignatureBytes, calculateSafeTransactionHash, buildSafeTransaction } from '../../src/utils/execution'
+import {
+  buildSignatureBytes,
+  calculateSafeTransactionHash,
+  buildSafeTransaction,
+  buildContractCall,
+  calculateRelayMessageHash,
+} from '../../src/utils/execution'
 import { parseEther } from '@ethersproject/units'
 import { chainId } from '../utils/encoding'
 
@@ -15,7 +21,8 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
     await deployments.fixture()
 
     const transactionQueueInstance = await getTransactionQueueInstance()
-    const safe = await getTestSafe(user1, undefined, transactionQueueInstance.address)
+
+    const safe = await getTestSafe(user1, transactionQueueInstance.address)
 
     const setterSource = `
         contract StorageSetter {
@@ -38,17 +45,64 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
   describe('getTransactionHash', () => {
     it('should correctly calculate EIP-712 hash of the transaction', async () => {
-      const { safe, transactionQueueInstance } = await setupTests()
+      const { safe, transactionQueueInstance, storageSetter } = await setupTests()
 
-      const safeTransaction = buildSafeTransaction(safe.address, user1.address, 1_000_000_000_000_000_000, '0x', 0, '0')
-      const transactionHash = transactionQueueInstance.getTransactionHash()
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
+      const transactionHash = await transactionQueueInstance.getTransactionHash(
+        safe.address,
+        safeTransaction.to,
+        safeTransaction.value,
+        safeTransaction.data,
+        safeTransaction.nonce,
+        safeTransaction.operation,
+      )
+
+      const setStorageTx = buildContractCall(safe.address, storageSetter, 'setStorage', ['0xabcdad'], {
+        operation: 1,
+      })
+      const transactionHash2 = await transactionQueueInstance.getTransactionHash(
+        safe.address,
+        setStorageTx.to,
+        setStorageTx.value,
+        setStorageTx.data,
+        setStorageTx.nonce,
+        setStorageTx.operation,
+      )
 
       expect(transactionHash).to.eq(calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId()))
+      expect(transactionHash2).to.eq(calculateSafeTransactionHash(transactionQueueInstance, setStorageTx, await chainId()))
     })
   })
 
   describe('getRelayMessageHash', () => {
-    it('should correctly calculate EIP-712 hash of the relay message', async () => {})
+    it('should correctly calculate EIP-712 hash of the relay message', async () => {
+      const { safe, transactionQueueInstance, storageSetter } = await setupTests()
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
+      const transactionHash = await transactionQueueInstance.getTransactionHash(
+        safe.address,
+        safeTransaction.to,
+        safeTransaction.value,
+        safeTransaction.data,
+        safeTransaction.nonce,
+        safeTransaction.operation,
+      )
+      const relayMessageHash = await transactionQueueInstance.getRelayMessageHash(
+        transactionHash,
+        AddressZero,
+        1000000,
+        1000000,
+        user1.address,
+      )
+
+      expect(relayMessageHash).to.eq(
+        calculateRelayMessageHash(
+          transactionQueueInstance,
+          { safeTxHash: transactionHash, gasToken: AddressZero, maxFeePerGas: 1000000, gasLimit: 1000000, refundReceiver: user1.address },
+          await chainId(),
+        ),
+      )
+    })
   })
 
   describe('execTransaction', () => {
