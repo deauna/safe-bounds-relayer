@@ -40,7 +40,23 @@ contract GnosisSafeMock {
         (v, r, s) = signatureSplit(signature);
         require(
             owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v, r, s),
-            "Invalid signature"
+            "GnosisSafeMock: Invalid signature"
+        );
+    }
+
+    function checkNSignatures(
+        bytes32 dataHash,
+        bytes memory,
+        bytes memory signature,
+        uint256
+    ) public view {
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+        (v, r, s) = signatureSplit(signature);
+        require(
+            owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v, r, s),
+            "GnosisSafeMock: Invalid signature"
         );
     }
 
@@ -50,8 +66,9 @@ contract GnosisSafeMock {
         bytes calldata data,
         uint8 operation
     ) external returns (bool success) {
+        console.log("Module checks");
         require(module != address(0) && msg.sender == module, "GnosisSafeMock: Only the module can call this function");
-
+        console.log("Executing transaction from module");
         if (operation == 1) (success, ) = to.delegatecall(data);
         else (success, ) = to.call{value: value}(data);
     }

@@ -11,6 +11,7 @@ import {
   buildContractCall,
   calculateRelayMessageHash,
   executeTx,
+  signHash,
 } from '../../src/utils/execution'
 import { parseEther } from '@ethersproject/units'
 import { chainId } from '../utils/encoding'
@@ -112,26 +113,65 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
 
-      const signatures =
+      await expect(executeTx(transactionQueueInstance, safeTransaction, [{ signer: user1.address, data: '0x' }])).to.be.revertedWith(
+        'GnosisSafeMock: Invalid signature',
+      )
+    })
+
+    it('should revert if signatures are invalid', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
+
+      // The mock only supports ECDSA signatures with eth_sign/eip191
+      const signature =
         '0x' +
         '000000000000000000000000' +
         user1.address.slice(2) +
         '0000000000000000000000000000000000000000000000000000000000000041' +
         '00' // r, s, v
 
-      executeTx(transactionQueueInstance, safeTransaction, [{ signer: user1.address, data: signatures }])
-    })
-
-    it('should revert if signatures are invalid', async () => {
-      const { safe, transactionQueueInstance } = await setupTests()
+      await expect(executeTx(transactionQueueInstance, safeTransaction, [{ signer: user1.address, data: signature }])).to.be.revertedWith(
+        'GnosisSafeMock: Invalid signature',
+      )
     })
 
     it("should revert if the signed nonce doesn't match current safe nonce", async () => {
       const { safe, transactionQueueInstance } = await setupTests()
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '1')
+
+      const transactionHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+
+      // The mock only supports ECDSA signatures with eth_sign/eip191
+      const signature = await signHash(user1, transactionHash)
+
+      await expect(executeTx(transactionQueueInstance, safeTransaction, [signature])).to.be.revertedWith(
+        'GnosisSafeMock: Invalid signature',
+      )
     })
 
     it('should increase the nonce', async () => {
       const { safe, transactionQueueInstance } = await setupTests()
+      console.log(safe.address)
+      console.log(transactionQueueInstance.address)
+      await user1.sendTransaction({ to: safe.address, value: parseEther('1') })
+      console.log(await user1.provider.getBalance(safe.address))
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, parseEther('1'), '0x', 0, '0')
+      const transactionHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+
+      // The mock only supports ECDSA signatures with eth_sign/eip191
+      const signature = await signHash(user1, transactionHash)
+      console.log(
+        safe.interface.encodeFunctionData('execTransactionFromModule', [
+          safeTransaction.to,
+          safeTransaction.value,
+          safeTransaction.data,
+          safeTransaction.operation,
+        ]),
+      )
+      await executeTx(transactionQueueInstance, safeTransaction, [signature])
+      console.log(await user1.provider.getBalance(safe.address))
     })
   })
 

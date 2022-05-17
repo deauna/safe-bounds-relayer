@@ -3,6 +3,7 @@ pragma solidity >=0.8.0 <0.9.0;
 
 import "@gnosis.pm/safe-contracts/contracts/GnosisSafe.sol";
 import "@gnosis.pm/safe-contracts/contracts/common/SecuredTokenTransfer.sol";
+import "hardhat/console.sol";
 
 /// ERRORS ///
 
@@ -150,7 +151,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         }
 
         {
-            execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation, gasleft());
+            execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation);
 
             uint256 payment = handleRefund(
                 startGas,
@@ -185,7 +186,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         }
 
         {
-            success = execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation, gasleft());
+            success = execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation);
             if (!success) {
                 revert ExecutionFailure();
             }
@@ -290,21 +291,21 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
     /// @param value Native token value of transaction
     /// @param data Data payload of transaction
     /// @param operation Operation type of transaction: Call or DelegateCall
-    /// @param safeTxGas Gas amount that should be forwarded to the Transaction call
     /// @return success Boolean indicating success of the transaction
     function execute(
         address safe,
         address to,
         uint256 value,
         bytes memory data,
-        Enum.Operation operation,
-        uint256 safeTxGas
+        Enum.Operation operation
     ) internal returns (bool success) {
         // 0x468721a7 === execTransactionFromModule(address,uint256,bytes,uint8)
         bytes memory callData = abi.encodeWithSelector(bytes4(0x468721a7), to, value, data, operation);
+        uint256 remainingGas = gasleft();
+        console.logBytes(callData);
         // solhint-disable-next-line no-inline-assembly
         assembly {
-            success := call(safeTxGas, safe, 0, add(data, 0x20), mload(callData), 0, 0)
+            success := call(remainingGas, safe, 0, add(data, 0x20), mload(callData), 0, 0)
         }
     }
 
