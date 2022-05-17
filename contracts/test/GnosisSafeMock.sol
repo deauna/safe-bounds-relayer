@@ -66,12 +66,13 @@ contract GnosisSafeMock {
         bytes calldata data,
         uint8 operation
     ) external returns (bool success) {
-        console.log("Module checks");
         require(module != address(0) && msg.sender == module, "GnosisSafeMock: Only the module can call this function");
-        console.log("Executing transaction from module");
+
         if (operation == 1) (success, ) = to.delegatecall(data);
         else (success, ) = to.call{value: value}(data);
     }
 
     receive() external payable {}
+
+    fallback() external payable {}
 }

@@ -65,9 +65,9 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         address payable refundReceiver;
     }
 
-    mapping(address => uint256) internal safeNonces;
+    mapping(address => uint256) public safeNonces;
     // safeAdress -> tokenAddress -> RelayCondition
-    mapping(address => mapping(address => RelayCondition)) internal safeRelayConditions;
+    mapping(address => mapping(address => RelayCondition)) public safeRelayConditions;
 
     function domainSeparator() public view returns (bytes32) {
         return keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, this));
@@ -302,10 +302,9 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         // 0x468721a7 === execTransactionFromModule(address,uint256,bytes,uint8)
         bytes memory callData = abi.encodeWithSelector(bytes4(0x468721a7), to, value, data, operation);
         uint256 remainingGas = gasleft();
-        console.logBytes(callData);
         // solhint-disable-next-line no-inline-assembly
         assembly {
-            success := call(remainingGas, safe, 0, add(data, 0x20), mload(callData), 0, 0)
+            success := call(remainingGas, safe, 0, add(callData, 0x20), mload(callData), 0, 0)
         }
     }
 

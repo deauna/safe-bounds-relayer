@@ -153,25 +153,20 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
     it('should increase the nonce', async () => {
       const { safe, transactionQueueInstance } = await setupTests()
-      console.log(safe.address)
-      console.log(transactionQueueInstance.address)
+
+      expect(await transactionQueueInstance.safeNonces(safe.address)).to.eq(0)
+
       await user1.sendTransaction({ to: safe.address, value: parseEther('1') })
-      console.log(await user1.provider.getBalance(safe.address))
+
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, parseEther('1'), '0x', 0, '0')
       const transactionHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
 
       // The mock only supports ECDSA signatures with eth_sign/eip191
       const signature = await signHash(user1, transactionHash)
-      console.log(
-        safe.interface.encodeFunctionData('execTransactionFromModule', [
-          safeTransaction.to,
-          safeTransaction.value,
-          safeTransaction.data,
-          safeTransaction.operation,
-        ]),
-      )
+
       await executeTx(transactionQueueInstance, safeTransaction, [signature])
-      console.log(await user1.provider.getBalance(safe.address))
+
+      expect(await transactionQueueInstance.safeNonces(safe.address)).to.eq(1)
     })
   })
 
