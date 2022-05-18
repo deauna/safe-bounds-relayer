@@ -2,7 +2,7 @@
 pragma solidity >=0.8.0 <0.9.0;
 
 import "@gnosis.pm/safe-contracts/contracts/GnosisSafe.sol";
-import "@gnosis.pm/safe-contracts/contracts/common/SecuredTokenTransfer.sol";
+import "@gnosis.pm/safe-contracts/contracts/common/Enum.sol";
 import "hardhat/console.sol";
 
 /// ERRORS ///
@@ -25,15 +25,13 @@ error RelayGasPriceConditionsNotMet();
 /// @notice Thrown when failed to pay the refund
 error RefundFailure();
 
+/// @notice Thrown when the gas supplied by the relayer is less than signed gas limit
+error NotEnoughGas();
+
 /// @title SafeBoundsRelayer
 /// @author Mikhail Mikheev - <mikhail@gnosis.io>
 /// @notice Gnosis Safe module for relaying transactions with an upper bound in the gas price
-contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
-    enum Operation {
-        Call,
-        DelegateCall
-    }
-
+contract SafeTransactionQueueConditionalRefund is Enum {
     bytes32 private constant DOMAIN_SEPARATOR_TYPEHASH = keccak256("EIP712Domain(uint256 chainId,address verifyingContract)");
 
     bytes32 private constant SAFE_TX_TYPEHASH =
@@ -55,7 +53,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         address to;
         uint256 value;
         bytes data;
-        Enum.Operation operation;
+        SafeTransactionQueueConditionalRefund.Operation operation;
     }
 
     struct RelayParams {
@@ -94,6 +92,36 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         }
     }
 
+    /// @dev Executes a transaction from the Safe if it has the required amount of signatures. No Refund logic is performed.
+    /// @param safeTx Safe Transaction
+    /// @param signatures Packed signature data ({bytes32 r}{bytes32 s}{uint8 v})
+    /// @return success True if the transaction succeeded
+    function execTransaction(SafeTx calldata safeTx, bytes memory signatures) external payable returns (bool success) {
+        bytes32 safeTxHash;
+        {
+            uint256 nonce = safeNonces[safeTx.safe];
+            bytes memory encodedTransactionData = encodeTransactionData(
+                safeTx.safe,
+                safeTx.to,
+                safeTx.value,
+                safeTx.data,
+                safeTx.operation,
+                nonce
+            );
+            safeNonces[safeTx.safe] = nonce + 1;
+            safeTxHash = keccak256(encodedTransactionData);
+            GnosisSafe(safeTx.safe).checkSignatures(safeTxHash, encodedTransactionData, signatures);
+        }
+
+        {
+            success = execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation);
+            if (!success) {
+                revert ExecutionFailure();
+            }
+            emit SuccessfulExecution(safeTxHash, 0);
+        }
+    }
+
     function execTransactionWithRefund(
         // Transaction params
         SafeTx calldata safeTx,
@@ -105,6 +133,9 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         // initial gas = 21k + non_zero_bytes * 16 + zero_bytes * 4
         //            ~= 21k + calldata.length * [1/3 * 16 + 2/3 * 4]
         uint256 startGas = gasleft() + 21000 + msg.data.length * 8;
+        if (startGas < relayParams.gasLimit) {
+            revert NotEnoughGas();
+        }
 
         // Transaction checks
         bytes32 safeTxHash;
@@ -115,8 +146,8 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
                 safeTx.to,
                 safeTx.value,
                 safeTx.data,
-                nonce,
-                safeTx.operation
+                safeTx.operation,
+                nonce
             );
             safeNonces[safeTx.safe] = nonce + 1;
             safeTxHash = keccak256(encodedTransactionData);
@@ -154,6 +185,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
             execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation);
 
             uint256 payment = handleRefund(
+                safeTx.safe,
                 startGas,
                 relayParams.gasLimit,
                 relayParams.maxFeePerGas,
@@ -164,37 +196,8 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         }
     }
 
-    /// @dev Executes a transaction from the Safe if it has the required amount of signatures. No Refund logic is performed.
-    /// @param safeTx Safe Transaction
-    /// @param signatures Packed signature data ({bytes32 r}{bytes32 s}{uint8 v})
-    /// @return success True if the transaction succeeded
-    function execTransaction(SafeTx calldata safeTx, bytes memory signatures) external payable returns (bool success) {
-        bytes32 safeTxHash;
-        {
-            uint256 nonce = safeNonces[safeTx.safe];
-            bytes memory encodedTransactionData = encodeTransactionData(
-                safeTx.safe,
-                safeTx.to,
-                safeTx.value,
-                safeTx.data,
-                nonce,
-                safeTx.operation
-            );
-            safeNonces[safeTx.safe] = nonce + 1;
-            safeTxHash = keccak256(encodedTransactionData);
-            GnosisSafe(safeTx.safe).checkSignatures(safeTxHash, encodedTransactionData, signatures);
-        }
-
-        {
-            success = execute(safeTx.safe, safeTx.to, safeTx.value, safeTx.data, safeTx.operation);
-            if (!success) {
-                revert ExecutionFailure();
-            }
-            emit SuccessfulExecution(safeTxHash, 0);
-        }
-    }
-
     function handleRefund(
+        address safe,
         uint256 startGas,
         uint120 gasLimit,
         uint256 gasPrice,
@@ -206,27 +209,35 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         // 23k as an upper bound to cover the rest of refund logic
         uint256 gasConsumed = startGas - gasleft() + 23000;
         payment = min(gasConsumed, gasLimit) * gasPrice;
-        if (gasToken == address(0) && !receiver.send(payment)) {
-            revert RefundFailure();
-        } else if (!transferToken(gasToken, receiver, payment)) {
-            revert RefundFailure();
+
+        if (gasToken == address(0)) {
+            if (!execute(safe, receiver, payment, "0x", Operation.Call)) {
+                revert RefundFailure();
+            }
+        } else {
+            // 0xa9059cbb - keccack("transfer(address,uint256)")
+            bytes memory data = abi.encodeWithSelector(0xa9059cbb, receiver, payment);
+            if (!execute(safe, gasToken, 0, data, Operation.Call)) {
+                revert RefundFailure();
+            }
         }
     }
 
     /// @dev Returns transaction bytes to be signed by owners.
     /// @param safe Safe address
-    /// @param data Call data
-    /// @param nonce Transaction nonce
+    /// @param to Safe address
     /// @param value Native token value of the transaction
-    /// @param operation Operation type of the transaction (CALL, DELEGATECALl)
+    /// @param data Call data
+    /// @param operation Operation type of the transaction (CALL, DELEGATECALL)
+    /// @param nonce Transaction nonce
     /// @return Transaction bytes
     function encodeTransactionData(
         address safe,
         address to,
         uint256 value,
         bytes calldata data,
-        uint256 nonce,
-        Enum.Operation operation
+        Operation operation,
+        uint256 nonce
     ) public view returns (bytes memory) {
         bytes32 safeTransactionHash = keccak256(abi.encode(SAFE_TX_TYPEHASH, safe, to, value, keccak256(data), operation, nonce));
 
@@ -235,20 +246,21 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
 
     /// @dev Returns the transaction hash to be signed by owners.
     /// @param safe Safe address
-    /// @param data Call data
-    /// @param nonce Transaction nonce
+    /// @param to Safe address
     /// @param value Native token value of the transaction
+    /// @param data Call data
     /// @param operation Operation type of the transaction (CALL, DELEGATECALL)
+    /// @param nonce Transaction nonce
     /// @return Transaction hash
     function getTransactionHash(
         address safe,
         address to,
         uint256 value,
         bytes calldata data,
-        uint256 nonce,
-        Enum.Operation operation
+        Operation operation,
+        uint256 nonce
     ) public view returns (bytes32) {
-        return keccak256(encodeTransactionData(safe, to, value, data, nonce, operation));
+        return keccak256(encodeTransactionData(safe, to, value, data, operation, nonce));
     }
 
     /// @dev Returns the relay message bytes to be signed by owners.
@@ -272,6 +284,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
     /// @dev Returns the relay message hash to be signed by owners.
     /// @param safeTxHash Safe transaction hash
     /// @param gasToken Gas Token address
+    /// @param gasLimit Transaction gas limit
     /// @param maxFeePerGas Maximum fee
     /// @param refundReceiver Refund recipient address
     /// @return Relay message hash
@@ -299,13 +312,7 @@ contract SafeTransactionQueueConditionalRefund is SecuredTokenTransfer {
         bytes memory data,
         Enum.Operation operation
     ) internal returns (bool success) {
-        // 0x468721a7 === execTransactionFromModule(address,uint256,bytes,uint8)
-        bytes memory callData = abi.encodeWithSelector(bytes4(0x468721a7), to, value, data, operation);
-        uint256 remainingGas = gasleft();
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            success := call(remainingGas, safe, 0, add(callData, 0x20), mload(callData), 0, 0)
-        }
+        success = GnosisSafe(payable(safe)).execTransactionFromModule(to, value, data, operation);
     }
 
     /**

@@ -38,10 +38,14 @@ contract GnosisSafeMock {
         bytes32 r;
         bytes32 s;
         (v, r, s) = signatureSplit(signature);
-        require(
-            owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v, r, s),
-            "GnosisSafeMock: Invalid signature"
-        );
+        if (v > 30) {
+            require(
+                owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v - 4, r, s),
+                "GnosisSafeMock: Invalid signature"
+            );
+        } else {
+            require(owner == ecrecover(dataHash, v, r, s), "GnosisSafeMock: Invalid signature");
+        }
     }
 
     function checkNSignatures(
@@ -54,10 +58,14 @@ contract GnosisSafeMock {
         bytes32 r;
         bytes32 s;
         (v, r, s) = signatureSplit(signature);
-        require(
-            owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v, r, s),
-            "GnosisSafeMock: Invalid signature"
-        );
+        if (v > 30) {
+            require(
+                owner == ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v - 4, r, s),
+                "GnosisSafeMock: Invalid signature"
+            );
+        } else {
+            require(owner == ecrecover(dataHash, v, r, s), "GnosisSafeMock: Invalid signature");
+        }
     }
 
     function execTransactionFromModule(
