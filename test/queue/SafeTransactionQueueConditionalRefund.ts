@@ -5,16 +5,15 @@ import hre, { deployments, waffle } from 'hardhat'
 import '@nomiclabs/hardhat-ethers'
 import { deployContract, getTestSafe, getTransactionQueueInstance } from '../utils/setup'
 import {
-  buildSignatureBytes,
   calculateSafeTransactionHash,
   buildSafeTransaction,
   buildContractCall,
-  calculateRelayMessageHash,
+  calculateRefundParamsHash,
   executeTx,
   signHash,
-  signRelayMessageTypedData,
+  signRefundParamsTypedData,
   executeTxWithSignersAndRefund,
-  buildRelayMessage,
+  buildRefundParams,
   executeTxWithRefund,
   executeTxWithSigners,
   executeContractCallWithSigners,
@@ -43,11 +42,19 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
             }
         }`
     const storageSetter = await deployContract(user1, setterSource)
+    const revertorSource = `
+        contract Revertooor {
+            function setStorage(uint256 numba) public {
+                require(false, "Revert me!");
+            }
+        }`
+    const revertooor = await deployContract(user1, revertorSource)
 
     return {
       safe,
       transactionQueueInstance,
       storageSetter,
+      revertooor,
     }
   })
 
@@ -82,8 +89,8 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
     })
   })
 
-  describe('getRelayMessageHash', () => {
-    it('should correctly calculate EIP-712 hash of the relay message', async () => {
+  describe('getRefundParamsHash', () => {
+    it('should correctly calculate EIP-712 hash of the refund params', async () => {
       const { safe, transactionQueueInstance } = await setupTests()
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
@@ -95,7 +102,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         safeTransaction.nonce,
         safeTransaction.operation,
       )
-      const relayMessageHash = await transactionQueueInstance.getRelayMessageHash(
+      const refundParamsHash = await transactionQueueInstance.getRefundParamsHash(
         transactionHash,
         AddressZero,
         1000000,
@@ -103,13 +110,45 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         user1.address,
       )
 
-      expect(relayMessageHash).to.eq(
-        calculateRelayMessageHash(
+      expect(refundParamsHash).to.eq(
+        calculateRefundParamsHash(
           transactionQueueInstance,
           { safeTxHash: transactionHash, gasToken: AddressZero, maxFeePerGas: 1000000, gasLimit: 1000000, refundReceiver: user1.address },
           await chainId(),
         ),
       )
+    })
+  })
+
+  describe('setRefundCondition', () => {
+    it('sets refund conditions for msg.sender and token address', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const tokenAddress = `0x${'42'.repeat(20)}`
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [tokenAddress, 10000000000, 10000000, [user2.address]],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const refundConditionToken = await transactionQueueInstance.safeRefundConditions(safe.address, tokenAddress)
+      const refundConditionETH = await transactionQueueInstance.safeRefundConditions(safe.address, AddressZero)
+
+      expect(refundConditionETH.maxFeePerGas).to.eq(0)
+      expect(refundConditionETH.maxGasLimit).to.eq(0)
+      expect(refundConditionETH.allowedRefundReceiversCount).to.eq(0)
+
+      expect(refundConditionToken.maxFeePerGas).to.equal('10000000000')
+      expect(refundConditionToken.maxGasLimit).to.equal('10000000')
+      expect(refundConditionToken.allowedRefundReceiversCount).to.equal(1)
     })
   })
 
@@ -256,11 +295,11 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         signer: user1.address,
         data: '0x',
       }
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
-      const relayMsgSignature = await signRelayMessageTypedData(user1, transactionQueueInstance, relayMessage)
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParamsSignature = await signRefundParamsTypedData(user1, transactionQueueInstance, refundParams)
 
       await expect(
-        executeTxWithRefund(transactionQueueInstance, safeTransaction, [emptyTxSig], relayMessage, relayMsgSignature),
+        executeTxWithRefund(transactionQueueInstance, safeTransaction, [emptyTxSig], refundParams, refundParamsSignature),
       ).to.be.revertedWith('GnosisSafeMock: Invalid signature')
     })
 
@@ -274,11 +313,11 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         transactionQueueInstance,
         buildSafeTransaction(safe.address, user2.address, '2000000000000000000', '0x', 0, '0'),
       )
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
-      const relayMsgSignature = await signRelayMessageTypedData(user1, transactionQueueInstance, relayMessage)
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParamsSignature = await signRefundParamsTypedData(user1, transactionQueueInstance, refundParams)
 
       await expect(
-        executeTxWithRefund(transactionQueueInstance, safeTransaction, [differentTxSig], relayMessage, relayMsgSignature),
+        executeTxWithRefund(transactionQueueInstance, safeTransaction, [differentTxSig], refundParams, refundParamsSignature),
       ).to.be.revertedWith('GnosisSafeMock: Invalid signature')
     })
 
@@ -287,40 +326,40 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '1')
       const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
 
       await expect(
-        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], relayMessage, user1),
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1),
       ).to.be.revertedWith('GnosisSafeMock: Invalid signature')
     })
 
-    it('should revert if relay message signature has different transaction hash', async () => {
+    it('should revert if refund message signature has different transaction hash', async () => {
       const { safe, transactionQueueInstance } = await setupTests()
 
       await user1.sendTransaction({ to: safe.address, value: parseEther('1.5') })
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
-      const relayMessage = buildRelayMessage(`0x${'0'.repeat(64)}`, AddressZero, 500000, 10000000000, user1.address)
+      const refundParams = buildRefundParams(`0x${'0'.repeat(64)}`, AddressZero, 500000, 10000000000, user1.address)
 
       await expect(
-        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], relayMessage, user1),
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1),
       ).to.be.revertedWith('GnosisSafeMock: Invalid signature')
     })
 
-    it('should revert if relay message signature is not present', async () => {
+    it('should revert if refund message signature is not present', async () => {
       const { safe, transactionQueueInstance } = await setupTests()
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '0')
       const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
       const differentTxSig = await queueSignTypedData(user1, transactionQueueInstance, safeTransaction)
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
-      const relayMsgSignature = {
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParamsSignature = {
         signer: user1.address,
         data: '0x',
       }
 
       await expect(
-        executeTxWithRefund(transactionQueueInstance, safeTransaction, [differentTxSig], relayMessage, relayMsgSignature),
+        executeTxWithRefund(transactionQueueInstance, safeTransaction, [differentTxSig], refundParams, refundParamsSignature),
       ).to.be.revertedWith('GnosisSafeMock: Invalid signature')
     })
 
@@ -333,7 +372,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       await executeContractCallWithSigners(
         transactionQueueInstance,
         transactionQueueInstance,
-        'setRelayCondition',
+        'setRefundConditions',
         [AddressZero, 10000000000, 10000000, []],
         [user1],
         {
@@ -346,10 +385,10 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, '1000000000000000000', '0x', 0, '1')
       const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
 
       await expect(
-        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], relayMessage, user1, { gasLimit: 300000 }),
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1, { gasLimit: 300000 }),
       ).to.be.revertedWith('NotEnoughGas')
     })
 
@@ -362,7 +401,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       await executeContractCallWithSigners(
         transactionQueueInstance,
         transactionQueueInstance,
-        'setRelayCondition',
+        'setRefundConditions',
         [AddressZero, 10000000000, 10000000, []],
         [user1],
         {
@@ -375,9 +414,9 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, parseEther('1'), '0x', 0, '1')
       const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 500000, 10000000000, user1.address)
+      const refundParams = buildRefundParams(txHash, AddressZero, 500000, 10000000000, user1.address)
 
-      await executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], relayMessage, user1)
+      await executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1)
 
       expect(await transactionQueueInstance.safeNonces(safe.address)).to.eq(2)
     })
@@ -394,7 +433,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       await executeContractCallWithSigners(
         transactionQueueInstance,
         transactionQueueInstance,
-        'setRelayCondition',
+        'setRefundConditions',
         [AddressZero, 10000000000, 10000000, []],
         [user1],
         {
@@ -407,11 +446,11 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
 
       const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
       const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
-      const relayMessage = buildRelayMessage(txHash, AddressZero, 120000, 10000000000, user2.address)
+      const refundParams = buildRefundParams(txHash, AddressZero, 120000, 10000000000, user2.address)
 
       const userBalanceBeforeTransfer = await provider.getBalance(user1.address)
       const queueConnectedToUser2 = await transactionQueueInstance.connect(user2)
-      await executeTxWithSignersAndRefund(queueConnectedToUser2, safeTransaction, [user1], relayMessage, user1)
+      await executeTxWithSignersAndRefund(queueConnectedToUser2, safeTransaction, [user1], refundParams, user1)
       const userBalanceAfterTransfer = await provider.getBalance(user1.address)
 
       expect(userBalanceAfterTransfer.sub(userBalanceBeforeTransfer)).to.eq(transferAmountWei)
@@ -427,7 +466,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       await executeContractCallWithSigners(
         transactionQueueInstance,
         transactionQueueInstance,
-        'setRelayCondition',
+        'setRefundConditions',
         [AddressZero, 10000000000, 10000000, []],
         [user1],
         {
@@ -442,7 +481,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         await provider.getStorageAt(storageSetter.address, '0x7373737373737373737373737373737373737373737373737373737373737373'),
       ).to.eq(`0x${'0'.repeat(64)}`)
 
-      const relayMessage = buildRelayMessage('', AddressZero, 150000, 10000000000, user2.address)
+      const refundParams = buildRefundParams('', AddressZero, 150000, 10000000000, user2.address)
       const queueConnectedToUser2 = await transactionQueueInstance.connect(user2)
       await executeContractCallWithSigners(
         queueConnectedToUser2,
@@ -456,7 +495,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
           value: '0',
           operation: 0,
         },
-        relayMessage,
+        refundParams,
         user1,
       )
       const num = 73
@@ -476,7 +515,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       await executeContractCallWithSigners(
         transactionQueueInstance,
         transactionQueueInstance,
-        'setRelayCondition',
+        'setRefundConditions',
         [AddressZero, 10000000000, 10000000, []],
         [user1],
         {
@@ -491,7 +530,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
         await provider.getStorageAt(storageSetter.address, '0x7373737373737373737373737373737373737373737373737373737373737373'),
       ).to.eq(`0x${'0'.repeat(64)}`)
 
-      const relayMessage = buildRelayMessage('', AddressZero, 150000, 10000000000, user2.address)
+      const refundParams = buildRefundParams('', AddressZero, 150000, 10000000000, user2.address)
       const queueConnectedToUser2 = await transactionQueueInstance.connect(user2)
       await executeContractCallWithSigners(
         queueConnectedToUser2,
@@ -505,7 +544,7 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
           value: '0',
           operation: 1,
         },
-        relayMessage,
+        refundParams,
         user1,
       )
       const num = 73
@@ -515,18 +554,223 @@ describe('SafeTransactionQueueConditionalRefund', async () => {
       )
     })
 
-    it('should send ether refund', async () => {})
+    it('should send ether refund', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const provider = hre.ethers.provider
+      const transferAmountWei = parseEther('1.5')
+      const maxGasRefund = BigNumber.from('10000000000').mul('120000')
 
-    it('should fail if not enough ether to refund', async () => {})
+      await user1.sendTransaction({ to: safe.address, value: transferAmountWei.add(maxGasRefund) })
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, []],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
+      const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+      const refundParams = buildRefundParams(txHash, AddressZero, 120000, 10000000000, user2.address)
+
+      const user2BalanceBeforeTransfer = await provider.getBalance(user2.address)
+      const tx = executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1)
+      await expect(tx).to.emit(transactionQueueInstance, 'SuccessfulExecution').withArgs
+      const txReceipt = await (await tx).wait(1)
+      const successEvent = transactionQueueInstance.interface.decodeEventLog(
+        'SuccessfulExecution',
+        txReceipt.logs[0].data,
+        txReceipt.logs[0].topics,
+      )
+      const user2BalanceAfterTransfer = await provider.getBalance(user2.address)
+      expect(user2BalanceAfterTransfer).to.be.equal(user2BalanceBeforeTransfer.add(successEvent.payment))
+    })
+
+    it('should fail if not enough ether to refund', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const provider = hre.ethers.provider
+      const transferAmountWei = parseEther('1')
+
+      await user1.sendTransaction({ to: safe.address, value: transferAmountWei })
+      expect(await provider.getBalance(safe.address)).to.eq(transferAmountWei)
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, []],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
+      const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+      const refundParams = buildRefundParams(txHash, AddressZero, 120000, 10000000000, user2.address)
+      const queueConnectedToUser2 = await transactionQueueInstance.connect(user2)
+
+      await expect(executeTxWithSignersAndRefund(queueConnectedToUser2, safeTransaction, [user1], refundParams, user1)).to.be.revertedWith(
+        'RefundFailure()',
+      )
+    })
 
     it('should send token refund', async () => {})
 
-    it('should send the refund if the internal transaction reverted', async () => {})
+    it('should send the refund if the internal transaction reverted', async () => {
+      const { safe, transactionQueueInstance, revertooor } = await setupTests()
+      const provider = hre.ethers.provider
+      const maxGasRefund = BigNumber.from('10000000000').mul('150000')
 
-    it('should respect the relayer allowlist', async () => {})
+      await user1.sendTransaction({ to: safe.address, value: maxGasRefund })
 
-    it('should respect maxFeePerGas relay boundary', async () => {})
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, []],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
 
-    it('should respect maxGasLimit relay boundary', async () => {})
+      const refundParams = buildRefundParams('', AddressZero, 150000, 10000000000, user2.address)
+
+      const user2BalanceBeforeTransfer = await provider.getBalance(user2.address)
+      const tx = await executeContractCallWithSigners(
+        transactionQueueInstance,
+        revertooor,
+        'setStorage',
+        [73],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '1',
+          value: '0',
+          operation: 0,
+        },
+        refundParams,
+        user1,
+      )
+      await expect(tx).to.emit(transactionQueueInstance, 'SuccessfulExecution').withArgs
+      const txReceipt = await (await tx).wait(1)
+      const successEvent = transactionQueueInstance.interface.decodeEventLog(
+        'SuccessfulExecution',
+        txReceipt.logs[0].data,
+        txReceipt.logs[0].topics,
+      )
+      const user2BalanceAfterTransfer = await provider.getBalance(user2.address)
+      expect(user2BalanceAfterTransfer).to.be.equal(user2BalanceBeforeTransfer.add(successEvent.payment))
+    })
+
+    it('should respect the refund receiver allowlist', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const provider = hre.ethers.provider
+      const transferAmountWei = parseEther('1.5')
+      const maxGasRefund = BigNumber.from('10000000000').mul('120000')
+
+      await user1.sendTransaction({ to: safe.address, value: transferAmountWei.add(maxGasRefund) })
+      expect(await provider.getBalance(safe.address)).to.eq(transferAmountWei.add(maxGasRefund))
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, [user1.address]],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
+      const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+      const refundParams = buildRefundParams(txHash, AddressZero, 120000, 10000000000, user2.address)
+
+      await expect(
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1),
+      ).to.be.revertedWith('InvalidRefundReceiver()')
+    })
+
+    it('should respect maxFeePerGas refund boundary', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const provider = hre.ethers.provider
+      const transferAmountWei = parseEther('1.5')
+      const maxGasRefund = BigNumber.from('10000000000').mul('120000')
+
+      await user1.sendTransaction({ to: safe.address, value: transferAmountWei.add(maxGasRefund) })
+      expect(await provider.getBalance(safe.address)).to.eq(transferAmountWei.add(maxGasRefund))
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, []],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
+      const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+      const refundParams = buildRefundParams(txHash, AddressZero, 120000, 100000000000, user2.address)
+
+      await expect(
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1),
+      ).to.be.revertedWith('RefundGasBoundariesNotMet()')
+    })
+
+    it('should respect maxGasLimit refund boundary', async () => {
+      const { safe, transactionQueueInstance } = await setupTests()
+      const provider = hre.ethers.provider
+      const transferAmountWei = parseEther('1.5')
+      const maxGasRefund = BigNumber.from('10000000000').mul('120000')
+
+      await user1.sendTransaction({ to: safe.address, value: transferAmountWei.add(maxGasRefund) })
+      expect(await provider.getBalance(safe.address)).to.eq(transferAmountWei.add(maxGasRefund))
+
+      await executeContractCallWithSigners(
+        transactionQueueInstance,
+        transactionQueueInstance,
+        'setRefundConditions',
+        [AddressZero, 10000000000, 10000000, []],
+        [user1],
+        {
+          safe: safe.address,
+          nonce: '0',
+          value: '0',
+          operation: 0,
+        },
+      )
+
+      const safeTransaction = buildSafeTransaction(safe.address, user1.address, transferAmountWei, '0x', 0, '1')
+      const txHash = calculateSafeTransactionHash(transactionQueueInstance, safeTransaction, await chainId())
+      const refundParams = buildRefundParams(txHash, AddressZero, 10000000 + 5000000, 10000000000, user2.address)
+
+      await expect(
+        executeTxWithSignersAndRefund(transactionQueueInstance, safeTransaction, [user1], refundParams, user1),
+      ).to.be.revertedWith('RefundGasBoundariesNotMet()')
+    })
   })
 })

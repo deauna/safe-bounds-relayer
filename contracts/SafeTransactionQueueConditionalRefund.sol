@@ -7,45 +7,48 @@ import "hardhat/console.sol";
 
 /// ERRORS ///
 
-/// @notice Thrown when the provided transaction signatures we invalid
-error InvalidTransactionSignatures();
-
-/// @notice Thrown when the provided relay signature is invalid
-error InvalidRelaySignature();
-
 /// @notice Thrown when the transaction reverts during the execution
 error ExecutionFailure();
 
 /// @notice Thrown when the refund receiver was not allowlisted
 error InvalidRefundReceiver();
 
-/// @notice Thrown when relaying conditions were not met
-error RelayGasPriceConditionsNotMet();
+/// @notice Thrown when refund conditions for gas limit or gas price were not met
+error RefundGasBoundariesNotMet();
 
 /// @notice Thrown when failed to pay the refund
 error RefundFailure();
 
-/// @notice Thrown when the gas supplied by the relayer is less than signed gas limit
+/// @notice Thrown when the gas supplied to the transaction is less than signed gas limit
 error NotEnoughGas();
 
-/// @title SafeBoundsRelayer
-/// @author Mikhail Mikheev - <mikhail@gnosis.io>
-/// @notice Gnosis Safe module for relaying transactions with an upper bound in the gas price
+/**
+ * @title SafeTransactionQueueConditionalRefund
+ * @author @mikhailxyz
+ * @notice SafeTransactionQueueConditionalRefund is an alternative transaction queue for the Gnosis Safe using the modules feature.
+ *         The built-in transaction queue of the Gnosis Safe does not work well for refunds in multi-sig scenarios.
+ *         For example, the refund gas price is a part of the transaction that has to be signed by the owners.
+ *         Since the gas price is volatile on some networks, if the network gas price is higher than the refund gas price
+ *         at the time of the execution, the relayer doesn't have an economic motivation to pick up the transaction.
+ *         The owners must either wait for the price to go down or regather transaction signatures with a higher gas price.
+ *         This contract separates the transaction and refund params (Gas Price, Gas Limit, Refund Receiver, Gas Token).
+ *         The refund params have to be signed only by 1 owner. To protect from unreasonably high gas prices, safe owners can set boundaries for each param.
+ */
 contract SafeTransactionQueueConditionalRefund is Enum {
     bytes32 private constant DOMAIN_SEPARATOR_TYPEHASH = keccak256("EIP712Domain(uint256 chainId,address verifyingContract)");
 
     bytes32 private constant SAFE_TX_TYPEHASH =
         keccak256("SafeTx(address safe,address to,uint256 value,bytes data,uint8 operation,uint256 nonce)");
-    bytes32 private constant RELAY_MSG_TYPEHASH =
-        keccak256("RelayMsg(bytes32 safeTxHash,address gasToken,uint120 gasLimit,uint120 maxFeePerGas,address refundReceiver)");
+    bytes32 private constant REFUND_PARAMS_TYPEHASH =
+        keccak256("RefundParams(bytes32 safeTxHash,address gasToken,uint120 gasLimit,uint120 maxFeePerGas,address refundReceiver)");
 
     event SuccessfulExecution(bytes32 txHash, uint256 payment);
 
-    struct RelayCondition {
+    struct RefundCondition {
         uint120 maxFeePerGas;
         uint120 maxGasLimit;
-        uint16 allowedRelayersCount;
-        mapping(address => bool) allowedRelayers;
+        uint16 allowedRefundReceiversCount;
+        mapping(address => bool) refundReceiverAllowlist;
     }
 
     struct SafeTx {
@@ -53,10 +56,10 @@ contract SafeTransactionQueueConditionalRefund is Enum {
         address to;
         uint256 value;
         bytes data;
-        SafeTransactionQueueConditionalRefund.Operation operation;
+        Enum.Operation operation;
     }
 
-    struct RelayParams {
+    struct RefundParams {
         address gasToken;
         uint120 gasLimit;
         uint120 maxFeePerGas;
@@ -64,8 +67,8 @@ contract SafeTransactionQueueConditionalRefund is Enum {
     }
 
     mapping(address => uint256) public safeNonces;
-    // safeAdress -> tokenAddress -> RelayCondition
-    mapping(address => mapping(address => RelayCondition)) public safeRelayConditions;
+    // safeAddress -> tokenAddress -> RefundCondition
+    mapping(address => mapping(address => RefundCondition)) public safeRefundConditions;
 
     function domainSeparator() public view returns (bytes32) {
         return keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, this));
@@ -75,24 +78,26 @@ contract SafeTransactionQueueConditionalRefund is Enum {
     /// @param tokenAddress Refund token address
     /// @param maxFeePerGas Maximum fee
     /// @param maxGasLimit Maximum gas limit that can be refunded, includes base gas (gas independent of the transaction execution)
-    /// @param relayerAllowlist Addresses of allowed relayers
-    function setRelayCondition(
+    /// @param refundReceiverAllowlist Addresses of allowed refund receivers
+    function setRefundConditions(
         address tokenAddress,
         uint120 maxFeePerGas,
         uint120 maxGasLimit,
-        address[] calldata relayerAllowlist
+        address[] calldata refundReceiverAllowlist
     ) public {
-        RelayCondition storage relayCondition = safeRelayConditions[msg.sender][tokenAddress];
-        relayCondition.maxFeePerGas = maxFeePerGas;
-        relayCondition.maxGasLimit = maxGasLimit;
-        relayCondition.allowedRelayersCount = uint16(relayerAllowlist.length);
+        RefundCondition storage refundCondition = safeRefundConditions[msg.sender][tokenAddress];
+        refundCondition.maxFeePerGas = maxFeePerGas;
+        refundCondition.maxGasLimit = maxGasLimit;
+        refundCondition.allowedRefundReceiversCount = uint16(refundReceiverAllowlist.length);
 
         unchecked {
-            for (uint256 i = 0; i < relayerAllowlist.length; i++) relayCondition.allowedRelayers[relayerAllowlist[i]] = true;
+            for (uint16 i = 0; i < refundCondition.allowedRefundReceiversCount; i++)
+                refundCondition.refundReceiverAllowlist[refundReceiverAllowlist[i]] = true;
         }
     }
 
     /// @dev Executes a transaction from the Safe if it has the required amount of signatures. No Refund logic is performed.
+    /// Mention that guards are not taken into account.
     /// @param safeTx Safe Transaction
     /// @param signatures Packed signature data ({bytes32 r}{bytes32 s}{uint8 v})
     /// @return success True if the transaction succeeded
@@ -127,13 +132,13 @@ contract SafeTransactionQueueConditionalRefund is Enum {
         SafeTx calldata safeTx,
         bytes memory txSignatures,
         // Refund params
-        RelayParams calldata relayParams,
-        bytes memory relaySignature
+        RefundParams calldata refundParams,
+        bytes memory refundSignature
     ) external payable {
         // initial gas = 21k + non_zero_bytes * 16 + zero_bytes * 4
         //            ~= 21k + calldata.length * [1/3 * 16 + 2/3 * 4]
         uint256 startGas = gasleft() + 21000 + msg.data.length * 8;
-        if (startGas < relayParams.gasLimit) {
+        if (startGas < refundParams.gasLimit) {
             revert NotEnoughGas();
         }
 
@@ -154,31 +159,31 @@ contract SafeTransactionQueueConditionalRefund is Enum {
             GnosisSafe(safeTx.safe).checkSignatures(safeTxHash, encodedTransactionData, txSignatures);
         }
 
-        // Relayer checks
+        // Refund params checks
         {
-            bytes memory encodedRelayMsgData = encodeRelayMessageData(
+            bytes memory encodedRefundParamsData = encodeRefundParamsData(
                 safeTxHash,
-                relayParams.gasToken,
-                relayParams.gasLimit,
-                relayParams.maxFeePerGas,
-                relayParams.refundReceiver
+                refundParams.gasToken,
+                refundParams.gasLimit,
+                refundParams.maxFeePerGas,
+                refundParams.refundReceiver
             );
-            bytes32 relayMsgHash = keccak256(encodedRelayMsgData);
-            GnosisSafe(safeTx.safe).checkNSignatures(relayMsgHash, encodedRelayMsgData, relaySignature, 1);
+            bytes32 refundParamsHash = keccak256(encodedRefundParamsData);
+            GnosisSafe(safeTx.safe).checkNSignatures(refundParamsHash, encodedRefundParamsData, refundSignature, 1);
         }
 
-        RelayCondition storage relayCondition = safeRelayConditions[safeTx.safe][relayParams.gasToken];
+        RefundCondition storage refundCondition = safeRefundConditions[safeTx.safe][refundParams.gasToken];
         // If an allowlist is enforced, check if the refundReceiver is allowed and doesnt equal to zero address
         if (
-            relayCondition.allowedRelayersCount != 0 &&
-            (relayCondition.allowedRelayers[relayParams.refundReceiver] == false || relayParams.refundReceiver == address(0))
+            refundCondition.allowedRefundReceiversCount != 0 &&
+            (refundCondition.refundReceiverAllowlist[refundParams.refundReceiver] == false)
         ) {
             revert InvalidRefundReceiver();
         }
 
         // Gas price and limit check
-        if (relayParams.maxFeePerGas > relayCondition.maxFeePerGas || relayParams.gasLimit > relayCondition.maxGasLimit) {
-            revert RelayGasPriceConditionsNotMet();
+        if (refundParams.maxFeePerGas > refundCondition.maxFeePerGas || refundParams.gasLimit > refundCondition.maxGasLimit) {
+            revert RefundGasBoundariesNotMet();
         }
 
         {
@@ -187,10 +192,10 @@ contract SafeTransactionQueueConditionalRefund is Enum {
             uint256 payment = handleRefund(
                 safeTx.safe,
                 startGas,
-                relayParams.gasLimit,
-                relayParams.maxFeePerGas,
-                relayParams.gasToken,
-                relayParams.refundReceiver
+                refundParams.gasLimit,
+                refundParams.maxFeePerGas,
+                refundParams.gasToken,
+                refundParams.refundReceiver
             );
             emit SuccessfulExecution(safeTxHash, payment);
         }
@@ -263,39 +268,41 @@ contract SafeTransactionQueueConditionalRefund is Enum {
         return keccak256(encodeTransactionData(safe, to, value, data, operation, nonce));
     }
 
-    /// @dev Returns the relay message bytes to be signed by owners.
+    /// @dev Returns the refund params bytes to be signed by owners.
     /// @param safeTxHash Safe transaction hash
     /// @param gasToken Gas Token address
     /// @param maxFeePerGas Maximum fee
     /// @param refundReceiver Refund recipient address
-    /// @return Relay message bytes
-    function encodeRelayMessageData(
+    /// @return Refund params bytes
+    function encodeRefundParamsData(
         bytes32 safeTxHash,
         address gasToken,
         uint120 gasLimit,
         uint120 maxFeePerGas,
         address refundReceiver
     ) public view returns (bytes memory) {
-        bytes32 safeOperationHash = keccak256(abi.encode(RELAY_MSG_TYPEHASH, safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver));
+        bytes32 safeOperationHash = keccak256(
+            abi.encode(REFUND_PARAMS_TYPEHASH, safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver)
+        );
 
         return abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), safeOperationHash);
     }
 
-    /// @dev Returns the relay message hash to be signed by owners.
+    /// @dev Returns the refund params hash to be signed by owners.
     /// @param safeTxHash Safe transaction hash
     /// @param gasToken Gas Token address
     /// @param gasLimit Transaction gas limit
     /// @param maxFeePerGas Maximum fee
     /// @param refundReceiver Refund recipient address
-    /// @return Relay message hash
-    function getRelayMessageHash(
+    /// @return Refund params hash
+    function getRefundParamsHash(
         bytes32 safeTxHash,
         address gasToken,
         uint120 gasLimit,
         uint120 maxFeePerGas,
         address refundReceiver
     ) public view returns (bytes32) {
-        return keccak256(encodeRelayMessageData(safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver));
+        return keccak256(encodeRefundParamsData(safeTxHash, gasToken, gasLimit, maxFeePerGas, refundReceiver));
     }
 
     /// @dev Internal function to execute a transaction from the Safe
@@ -313,6 +320,23 @@ contract SafeTransactionQueueConditionalRefund is Enum {
         Enum.Operation operation
     ) internal returns (bool success) {
         success = GnosisSafe(payable(safe)).execTransactionFromModule(to, value, data, operation);
+    }
+
+    /**
+     * @dev A function to check if a given address is a valid refund receiver for a given Safe and token
+     * @param safe Safe address
+     * @param gasToken Gas Token address
+     * @param refundReceiver Refund receiver address
+     * @return Boolean indicating if the address is a valid refund receiver
+     */
+    function isAllowedRefundReceiver(
+        address safe,
+        address gasToken,
+        address refundReceiver
+    ) public view returns (bool) {
+        return
+            safeRefundConditions[safe][gasToken].allowedRefundReceiversCount == 0 ||
+            safeRefundConditions[safe][gasToken].refundReceiverAllowlist[refundReceiver];
     }
 
     /**
